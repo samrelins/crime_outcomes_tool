@@ -1,0 +1,157 @@
+```{r}
+library(tidyverse)
+
+# Will need to run download_and_clean_police_data.R and then point to the 
+# checkpoints directory in the downloaded data prior to running this analysis
+
+checkpoint_path <- "data/2024-04-12_police_data/checkpoints"
+
+street_path = file.path(checkpoint_path, "street.csv")
+street_data <- read_csv(street_path)
+
+outcomes_path = file.path(checkpoint_path, "outcomes.csv")
+outcomes_data <- read_csv(outcomes_path)
+
+# Define a function to consolidate similar outcome categories into a single category.
+combine_outcome_categories <- function(data, column_name) {
+    data %>%
+        mutate({{ column_name }} := case_when(
+            .data[[column_name]] %in% c(
+                "Formal action is not in the public interest",
+                "Further investigation is not in the public interest",
+                "Further action is not in the public interest"
+            ) ~ "Further action not in the public interest",
+            TRUE ~ .data[[column_name]]
+        )) %>%
+        rename(outcome = {{ column_name }})
+}
+
+drop_cols <- c("falls_within", "longitude", "latitude", "location", "lsoa_code", "lsoa_name")
+
+na_categories <- c("Status update unavailable", 
+                   "Court result unavailable", 
+                   "Awaiting court outcome",
+                   "Under investigation")
+
+street_data <- street_data %>%
+    select(-all_of(drop_cols), -context) %>%
+    filter(!is.na(crime_id),
+           crime_type != "Anti-social behaviour") %>%
+    combine_outcome_categories("last_outcome_category") %>%
+    mutate(outcome_cleaned = replace(outcome, outcome %in% na_categories, NA),
+           outcome_from = "street")
+
+outcomes_data <- outcomes_data %>%
+    select(-all_of(drop_cols)) %>%
+    filter(!is.na(crime_id)) %>%
+    combine_outcome_categories("outcome_type") %>%
+    mutate(outcome_cleaned = outcome,
+           outcome_from = "outcomes")
+
+combined_data <- bind_rows(street_data, outcomes_data)
+
+combined_data$month_date <- as.Date(paste0(combined_data$month, "-01"))
+
+combined_data <- combined_data %>%
+    group_by(crime_id) %>%
+    mutate(
+        n_outcomes = n_distinct(outcome_cleaned, na.rm=TRUE),  
+        earliest_month = min(month_date, na.rm = TRUE)
+   ) %>% 
+    mutate(
+       is_year_old = as.numeric(difftime(today(), earliest_month, units = "days")) >= 365
+   ) %>%
+    ungroup()
+```
+
+# Investigating Duplicate Entries
+
+All the datasets have multiple entries for individual crimes - it isn't entirely clear why. We're not too bothered about conflicting force/date/location data: 
+
+* dates are presumably duplicated when there are updates to crimes the date detailing the date of the update 
+* conflicting forces are very rare and presumably relate to crimes that are processed by two different forces 
+* conflicting location data seem to be universal - the location data are never identical for the same crime - this likely results from the fuzzing of locations for anonymisation. 
+
+We care about conflicting outcomes. 
+
+Outcome categories are as follows:
+
+Common to both `street` and `outcome` dataframes:
+
+* Unable to prosecute suspect 
+* Investigation complete; no suspect identified 
+* Formal action is not in the public interest 
+* Further investigation is not in the public interest 
+* Further action is not in the public interest 
+* Offender given a caution 
+* Local resolution 
+* Action to be taken by another organisation 
+* Suspect charged as part of another case 
+* Offender given a drugs possession warning 
+* Offender given penalty notice
+
+Unique to `street`:
+
+* Status update unavailable 
+* Court result unavailable 
+* Awaiting court outcome 
+* Under investigation
+
+Unique to `outcome`:
+
+* Suspect charged
+
+For the moment, we're combining "Formal action is not in the public interest","Further investigation is not in the public interest", "Further action is not in the public interest" as it isn't obvious that these are distinct in any way.
+
+We then count the crimes based on their recorded outcomes - for these counts we replace the "pending"/"unavailable" outcomes unique to the street data with NAs:
+
+(TLDR: 15.7% of crimes have an NA outcome when consider pending/unavailable as NA too, 0.7% have 2 or more conflicting outcomes)
+
+```{r}
+combined_data %>%
+    mutate(outcome_cleaned = if_else(n_outcomes > 1, "n_outcomes > 1", outcome_cleaned)) %>%
+    select(crime_id, outcome_cleaned) %>%
+    distinct() %>%
+    count(outcome_cleaned) %>%
+    mutate(pct = round((n / sum(n)) * 100, 2)) %>%
+    arrange(desc(n))
+```
+
+If we consider crimes that were first recorded one or more years ago i.e. a decent amount of time to give for an outcome to be reached, still 13.6% of crimes still don't have an outcome, so it doesn't look like it's the more recent crimes that are contributing for teh most part. 
+
+```{r}
+combined_data %>%
+    filter(is_year_old) %>%
+    mutate(outcome_cleaned = if_else(n_outcomes > 1, "n_outcomes > 1", outcome_cleaned)) %>%
+    select(crime_id, outcome_cleaned) %>%
+    distinct() %>%
+    count(outcome_cleaned) %>%
+    mutate(pct = round((n / sum(n)) * 100, 2)) %>%
+    arrange(desc(n))
+```
+
+
+The following script creates a "timeline" of outcomes for crimes that have conflicting outcomes. 
+
+TLDR - There isn't any obvious pattern that would allow us to easily create a rule for cleaning up conflicting outcomes. Given they are only 0.7% of the data I'm dropping them in the script that cleans the data for our tool.
+
+Examples of different progressions of outcomes:
+
+format [dataset "street" or "outcomes"] - [date] - [recorded outcome]
+
+* street - 2021-11 - Unable to prosecute suspect, outcomes - 2022-06 - Suspect charged, outcomes - 2023-11 - Unable to prosecute suspect, outcomes - 2024-02 - Unable to prosecute suspect
+* street - 2022-06 - Unable to prosecute suspect, outcomes - 2022-06 - Investigation complete; no suspect identified, outcomes - 2022-07 - Further action not in the public interest, outcomes - 2022-11 - Unable to prosecute suspect
+* street - 2023-11 - Awaiting court outcome, outcomes - 2023-11 - Unable to prosecute suspect, outcomes - 2023-12 - Investigation complete; no suspect identified, outcomes - 2024-02 - Suspect charged
+* street - 2022-05 - Court result unavailable, outcomes - 2022-05 - Offender given a caution, outcomes - 2022-05 - Offender given a caution, outcomes - 2022-05 - Offender given a caution, outcomes - 2022-06 - Suspect charged, outcomes - 2022-06 - Suspect charged, outcomes - 2022-06 - Suspect charged
+
+
+```{r}
+combined_data %>%
+    group_by(crime_id, n_outcomes) %>%
+    summarise(
+        outcome_list = toString(paste(outcome_from, month, outcome, sep = " - ")),
+        .groups = "drop"
+    ) %>%
+    filter(n_outcomes > 1)
+```
+
