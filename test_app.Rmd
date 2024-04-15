@@ -1,0 +1,120 @@
+# load cleaned data
+
+This will take a long time to run if you've yet to download the data. Otherwise the function will find and load the last cleaned download:
+
+```{r}
+library(tidyverse)
+source("download_and_clean_police_data.R")
+
+cleaned_outcomes_data <- download_and_process_police_data()
+```
+
+```{r}
+library(shiny)
+library(shinyWidgets)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(tidyverse)
+
+# Example assumption that cleaned_outcomes_data has a 'crime_type' column
+# You would need to ensure that 'crime_type' is included in your data preprocessing
+cleaned_outcomes_data_grouped <- cleaned_outcomes_data %>% 
+    mutate(crime_type = replace_na(crime_type, "Unknown")) %>%
+    group_by(reported_by, month, outcome, crime_type) %>% 
+    summarise(count = n(), .groups = "drop")
+
+# UI
+ui <- fluidPage(
+  titlePanel("Police Data"),
+  
+  sidebarLayout(
+    sidebarPanel(
+        selectInput("group_by", "Group Data By:",
+                    choices = c("Police Force" = "reported_by", "Crime Type" = "crime_type"), 
+                    selected = "reported_by"),
+        pickerInput("selected_forces", "Select Forces:", 
+                    choices = unique(cleaned_outcomes_data$reported_by), 
+                    selected = unique(cleaned_outcomes_data$reported_by), 
+                    multiple = TRUE, options = pickerOptions(actionsBox = TRUE)),
+
+        pickerInput("selected_crime_types", "Select Crime Types:",
+                  choices = unique(cleaned_outcomes_data$crime_type),
+                  selected = unique(cleaned_outcomes_data$crime_type),
+                  multiple = TRUE, options = pickerOptions(actionsBox = TRUE)),
+        
+        dateRangeInput("date_range", "Select Date Range:",
+                     start = paste(min(cleaned_outcomes_data$month), "-01", sep=""),
+                     end = paste(max(cleaned_outcomes_data$month), "-01", sep=""),
+                     format = "yyyy-mm-dd"),
+        
+        pickerInput("selected_outcomes", "Select Outcomes:",
+                  choices = unique(cleaned_outcomes_data$outcome),
+                  selected = unique(cleaned_outcomes_data$outcome),
+                  multiple = TRUE, options = pickerOptions(actionsBox = TRUE))
+    ),
+    
+    mainPanel(
+      plotOutput("plot", height = "1000px")
+    )
+  )
+)
+
+# Server function
+server <- function(input, output) {
+  # Filter the data based on selected options
+  filtered_data <- reactive({
+    req(input$date_range[1], input$date_range[2])
+    data <- cleaned_outcomes_data_grouped %>%
+      filter(reported_by %in% input$selected_forces,
+             crime_type %in% input$selected_crime_types,
+             month >= format(input$date_range[1], "%Y-%m"),
+             month <= format(input$date_range[2], "%Y-%m"),
+             outcome %in% input$selected_outcomes)
+    return(data)
+  })
+  
+  # Create the plot based on the selected grouping criterion
+  output$plot <- renderPlot({
+    aggregated_data <- filtered_data() %>%
+        group_by(!!sym(input$group_by), outcome) %>%
+        summarise(n = sum(count), .groups = "drop") %>%
+        mutate(proportion = n / sum(n))
+    
+    # Define colors for each outcome
+    outcome_colors <- c("Unable to prosecute suspect" = "#7B3294",
+                    "Action to be taken by another organisation" = "#C2A5CF",
+                    "Suspect charged" = "#5AB4AC",
+                    "Investigation complete; no suspect identified" = "#D01C8B",
+                    "Offender given a caution" = "#A6DBA0",
+                    "Further action not in the public interest" = "#F1B6DA",
+                    "Local resolution" = "#008837",
+                    "Offender given penalty notice" = "#F7F7F7",
+                    "Offender given a drugs possession warning" = "#FDAE61",
+                    "Suspect charged as part of another case" = "#FFFFBF")
+
+
+
+    
+    ggplot(aggregated_data, aes(x = proportion, y = fct_rev(!!sym(input$group_by)), fill = outcome)) +
+      geom_bar(stat = "identity", position = "fill") +
+      scale_fill_manual(values = outcome_colors) +
+      labs(x = NULL, y = NULL, fill = NULL) +
+      theme_minimal() +
+      theme(axis.text.y = element_text(size = 12),
+            legend.position = "top",
+            legend.key.size = unit(1, "cm"),
+            legend.text = element_text(size = 10),
+            panel.grid.major.x = element_blank(),
+            panel.grid.minor.x = element_blank()) +
+      guides(fill = guide_legend(nrow = 3))
+  })
+}
+
+# Run the app
+shinyApp(ui, server)
+
+```
+```{r}
+cleaned_outcomes_data_grouped %>% write_csv("data/2024-04-15_police_data/checkpoints/app_data.csv")
+```

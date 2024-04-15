@@ -61,7 +61,8 @@ download_and_process_police_data <- function(generate_new=FALSE) {
             data_dirs <- data_dirs[order(date_objects, decreasing = TRUE)]
             
             for (dir in data_dirs) {
-                file_path <- file.path(dir, "cleaned_outcomes_data.csv")
+                checkpoint_path <- file.path(dir, "checkpoints")
+                file_path <- file.path(checkpoint_path, "app_data.csv")
                 if (file.exists(file_path)) {
                     print("Already downloaded and cleaned. Reading cleaned data csv")
                     return(read_csv(file_path))
@@ -124,25 +125,24 @@ download_and_process_police_data <- function(generate_new=FALSE) {
     drop_cols <- c("falls_within", "longitude", "latitude", "location", "lsoa_code", "lsoa_name")
     
     print("Step 4 of 7: Cleaning Street Data")
+    na_outcomes = c("Status update unavailable", "Court result unavailable", 
+                    "Awaiting court outcome", "Under investigation")
     street_data <- police_data$street %>%
         select(-all_of(drop_cols), -context) %>%
-        filter(!is.na(crime_id),
-               !is.na(last_outcome_category),
-               crime_type != "Anti-social behaviour",
-               !last_outcome_category %in% c("Status update unavailable",
-                                             "Court result unavailable",
-                                             "Awaiting court outcome",
-                                             "Under investigation")) %>%
+        filter(!is.na(crime_id), 
+               crime_type != "Anti-social behaviour") %>%
+        mutate(last_outcome_category = ifelse(last_outcome_category %in% na_outcomes,  
+                                              NA, last_outcome_category)) %>%
         combine_outcome_categories("last_outcome_category") %>%
         distinct()
+    
     
     write_csv(street_data, file.path(checkpoint_path, "street_cleaned.csv"))
     
     print("Step 5 of 7: Cleaning Outcomes Data")
     outcomes_data <- police_data$outcomes %>%
         select(-all_of(drop_cols)) %>%
-        filter(!is.na(crime_id),
-               !is.na(outcome_type)) %>%
+        filter(!is.na(crime_id)) %>%
         combine_outcome_categories("outcome_type") %>%
         distinct()
     
@@ -153,6 +153,7 @@ download_and_process_police_data <- function(generate_new=FALSE) {
     combined_data <- bind_rows(street_data, outcomes_data)
     
     crime_outcomes <- combined_data %>%
+        filter(!is.na(outcome)) %>%
         group_by(crime_id) %>%
         summarise(n_outcomes = n_distinct(outcome),
                   outcome = first(outcome),
@@ -174,11 +175,14 @@ download_and_process_police_data <- function(generate_new=FALSE) {
     
     write_csv(crime_details, file.path(checkpoint_path, "crime_details.csv"))
     
-    cleaned_outcomes_data <- crime_outcomes %>%
-        left_join(crime_details, by = "crime_id")
+    app_data <- crime_outcomes %>%
+        left_join(crime_details, by = "crime_id") %>%
+        mutate(crime_type = replace_na(crime_type, "Unknown")) %>%
+        group_by(reported_by, month, outcome, crime_type) %>% 
+        summarise(count = n(), .groups = "drop")
     
-    write_csv(cleaned_outcomes_data, file.path(data_dir, "cleaned_outcomes_data.csv"))
-    return(clean_outcomes_data)
+    write_csv(cleaned_outcomes_data, file.path(checkpoint_path, "app_data.csv"))
+    return(cleaned_outcomes_data)
 }
 
 
